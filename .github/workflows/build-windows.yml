@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing GitHub Release tag that receives the installer
+        description: Existing GitHub Release tag that receives the installer (created automatically if missing)
         required: true
         default: v0.1.3-alpha.2
         type: string
@@ -48,6 +48,45 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($patch)) { throw 'Desktop customisation patch was not found after extraction.' }
           git -C source apply --check --binary $patch
           git -C source apply --binary $patch
+          $primaryCfg = "source/packages/desktop/primary-mode/tsconfig.json"
+          if (Test-Path $primaryCfg) {
+            $cfg = Get-Content $primaryCfg -Raw | ConvertFrom-Json
+            $cfg.references = @(@{ path = "../../../vendor/cordis" })
+            $cfg | ConvertTo-Json -Depth 5 | Set-Content $primaryCfg -Encoding utf8
+          }
+          $clientCfg = "source/tsconfig.client.json"
+          if (Test-Path $clientCfg) {
+            $cfg = Get-Content $clientCfg -Raw | ConvertFrom-Json
+            $desktopRefs = @(
+              @{ path = "./packages/desktop/primary-mode/tsconfig.json" },
+              @{ path = "./packages/desktop/primary-mode/tsconfig.client.json" },
+              @{ path = "./packages/desktop/puppy-theme/tsconfig.json" },
+              @{ path = "./packages/desktop/puppy-theme/tsconfig.client.json" },
+              @{ path = "./packages/desktop/code-workspace/tsconfig.json" },
+              @{ path = "./packages/desktop/code-workspace/tsconfig.client.json" },
+              @{ path = "./packages/desktop/code-insights/tsconfig.json" },
+              @{ path = "./packages/desktop/code-insights/tsconfig.client.json" }
+            )
+            $filtered = @()
+            foreach ($r in $cfg.references) {
+              if ($r.path -notmatch 'packages/desktop') {
+                $filtered += $r
+              }
+            }
+            $webIdx = -1
+            for ($i = 0; $i -lt $filtered.Count; $i++) {
+              if ($filtered[$i].path -eq './apps/web') {
+                $webIdx = $i
+                break
+              }
+            }
+            if ($webIdx -ge 0) {
+              $cfg.references = @($filtered[0..($webIdx - 1)]) + $desktopRefs + @($filtered[$webIdx..($filtered.Count - 1)])
+            } else {
+              $cfg.references = $filtered + $desktopRefs
+            }
+            $cfg | ConvertTo-Json -Depth 10 | Set-Content $clientCfg -Encoding utf8
+          }
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -66,14 +105,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # A source checkout deliberately does not contain generated Typert Remote
-      # contracts under package lib/ directories.  Emit them once before the
-      # aggregate TypeScript build so client packages can resolve their remote
-      # type entry points on a clean Windows runner.
+      # contracts under package lib/ directories. Build host libraries and run
+      # tsdown host pass once to emit the model-driven Remote contracts, and
+      # pre-compile the Desktop host package index entries so tsdown finds lib/types/index.js.
       - name: Bootstrap generated Remote contracts
         working-directory: source
         run: |
-          pnpm exec tsc -p packages/typert/generator/tsconfig.json
-          pnpm exec tsdown --env.DSH_BUILD_FACE host
+          pnpm exec tsc -b packages/typert/generator/tsconfig.json
+          pnpm run build:lib:host
+          pnpm exec tsc -b packages/desktop/primary-mode/tsconfig.json packages/desktop/puppy-theme/tsconfig.json packages/desktop/code-workspace/tsconfig.json packages/desktop/code-insights/tsconfig.json
 
       - name: Package unsigned Windows x64 installer
         working-directory: source
@@ -82,14 +122,36 @@ jobs:
       - name: Validate installer presence
         shell: pwsh
         run: |
-          $installer = Get-ChildItem source/.desktop-build/targets/win-x64/artifacts -Recurse -Filter *.exe | Select-Object -First 1
+          $installer = Get-ChildItem source -Recurse -Filter *.exe |
+            Where-Object { $_.Name -notmatch '__uninstaller' -and $_.DirectoryName -notmatch 'win-unpacked' -and $_.DirectoryName -match 'artifacts' } |
+            Select-Object -First 1
           if ($null -eq $installer) { throw 'Windows installer was not produced.' }
+          Write-Host "Found Windows installer: $($installer.FullName)"
           Get-FileHash $installer.FullName -Algorithm SHA256 | Format-List
 
-      - name: Upload installer to the selected GitHub Release
+      - name: Upload installer to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeek-Harness-win-x64
+          path: |
+            source/apps/desktop/.desktop-build/targets/win-x64/artifacts/*.exe
+            !source/apps/desktop/.desktop-build/targets/win-x64/artifacts/*__uninstaller.exe
+
+      - name: Upload installer to GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $installer = Get-ChildItem source/.desktop-build/targets/win-x64/artifacts -Recurse -Filter *.exe | Select-Object -First 1
-          gh release upload "${{ inputs.release_tag }}" "$($installer.FullName)#DeepSeek-Harness-win-x64.exe" --clobber
+          $installer = Get-ChildItem source -Recurse -Filter *.exe |
+            Where-Object { $_.Name -notmatch '__uninstaller' -and $_.DirectoryName -notmatch 'win-unpacked' -and $_.DirectoryName -match 'artifacts' } |
+            Select-Object -First 1
+          if ($null -eq $installer) { throw 'Windows installer not found for release upload.' }
+          $tag = "${{ inputs.release_tag }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release $tag does not exist yet. Creating release..."
+            gh release create $tag "$($installer.FullName)#DeepSeek-Harness-win-x64.exe" --title "DeepSeek Harness Desktop $tag" --notes "DeepSeek Harness Desktop Windows x64 release installer."
+          } else {
+            Write-Host "Release $tag found. Uploading asset..."
+            gh release upload $tag "$($installer.FullName)#DeepSeek-Harness-win-x64.exe" --clobber
+          }

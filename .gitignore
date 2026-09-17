@@ -2,6 +2,14 @@
 release/*.zip
 release/*.dmg
 release/*.app/
+release/*.exe
 
 # macOS metadata
 .DS_Store
+
+# Local build and tooling artifacts
+source/
+.tools/
+.unpacked_patch/
+unpacked/
+*.log
